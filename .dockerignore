@@ -1,0 +1,5 @@
+share/
+.venv/
+__pycache__/
+*.pyc
+.git/

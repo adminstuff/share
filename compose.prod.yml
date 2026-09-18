@@ -1,0 +1,27 @@
+# VPS : DOMAIN=partage.example.com docker compose -f compose.prod.yml up -d --build
+services:
+  share:
+    build: .
+    environment:
+      SHARE_TRUST_PROXY: "1"        # indispensable : sinon tous les clients ont l'IP de Caddy
+      SHARE_TTL: "3600"
+    expose: ["5000"]                # pas de port publié : seul Caddy y accède
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: ${DOMAIN:?renseigner DOMAIN=ton.domaine.fr}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data                     # certificats : à conserver
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
