@@ -31,8 +31,12 @@ app.request_class = MemoryRequest
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE + 4096  # werkzeug rejette au-delà -> 413
 
 if os.environ.get("SHARE_TRUST_PROXY"):
+    # hops = nombre de proxys de confiance devant l'app. 1 derrière Caddy/nginx,
+    # 2 sur Cloud Run (X-Forwarded-For: <client>,<load-balancer>). À vérifier sur
+    # l'IP affichée dans la liste des postes connectés.
     from werkzeug.middleware.proxy_fix import ProxyFix
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+    hops = int(os.environ.get("SHARE_PROXY_HOPS", 1))
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=hops, x_proto=hops)
 
 CODE_RE = re.compile(r"^[0-9A-F]{6}$")
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -637,5 +641,8 @@ def get_file(code):
 
 if __name__ == "__main__":
     from waitress import serve
-    serve(app, host=os.environ.get("SHARE_HOST", "0.0.0.0"),
-          port=int(os.environ.get("SHARE_PORT", 5000)), threads=8)
+    host = os.environ.get("SHARE_HOST", "0.0.0.0")
+    # PORT est imposé par Cloud Run / Heroku / Scaleway et doit primer.
+    port = int(os.environ.get("PORT") or os.environ.get("SHARE_PORT", 5000))
+    print(f"share: écoute sur {host}:{port}", flush=True)
+    serve(app, host=host, port=port, threads=8)

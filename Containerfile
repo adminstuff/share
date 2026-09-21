@@ -11,8 +11,9 @@ COPY share.py .
 RUN useradd -u 10001 -r -s /usr/sbin/nologin share
 USER 10001
 
+ENV PORT=5000
 EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=3s \
-  CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:5000/healthz').read()"
+  CMD python -c "import os,urllib.request;urllib.request.urlopen(f\"http://127.0.0.1:{os.environ['PORT']}/healthz\").read()"
 
 CMD ["python", "share.py"]

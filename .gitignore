@@ -2,3 +2,4 @@ share/
 .venv/
 __pycache__/
 *.pyc
+claude.txt
