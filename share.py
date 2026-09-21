@@ -177,10 +177,7 @@ HTML = r"""<!doctype html>
   <div id="peers"></div>
 
   <textarea id="text" rows="6" placeholder="Collez votre texte ici…"></textarea>
-  <div class="row">
-    <button onclick="sendText()">Partager</button>
-    <button onclick="copyText()">Copier</button>
-  </div>
+  <button onclick="sendText()">Partager</button>
   <small>Entrée pour partager, Maj+Entrée pour aller à la ligne.</small>
   <hr>
   <input type="file" id="file">
@@ -375,8 +372,6 @@ async function sendText(){
   say('');
   hv = -1;                         // recharge l'historique au prochain sondage
 }
-
-function copyText(){ navigator.clipboard.writeText($('text').value).catch(() => say("Copie refusée par le navigateur.")); }
 
 async function sendFile(){
   const f = $('file').files[0];
