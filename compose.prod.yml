@@ -15,6 +15,9 @@ services:
 
   caddy:
     image: caddy:2-alpine
+    # podman rootless ne peut pas ouvrir 80/443 :
+    #   sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80   (+ /etc/sysctl.d/ pour le rendre permanent)
+    # avec docker (root) sur le VPS : rien à faire.
     ports: ["80:80", "443:443"]
     environment:
       DOMAIN: ${DOMAIN:?renseigner DOMAIN=ton.domaine.fr}
