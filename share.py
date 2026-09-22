@@ -9,6 +9,7 @@ MAX_TOTAL = int(os.environ.get("SHARE_MAX_TOTAL", 512 * 1024 * 1024))
 MAX_ROOMS = int(os.environ.get("SHARE_MAX_ROOMS", 500))
 MAX_TEXT = int(os.environ.get("SHARE_MAX_TEXT", 100_000))
 MAX_HIST = int(os.environ.get("SHARE_MAX_HIST", 20))                   # entrées gardées
+MAX_FILES = int(os.environ.get("SHARE_MAX_FILES", 10))                 # fichiers gardés par room
 MAX_HIST_CHARS = int(os.environ.get("SHARE_MAX_HIST_CHARS", 200_000))  # par room
 MAX_PENDING = int(os.environ.get("SHARE_MAX_PENDING", 5))              # demandes en attente
 PENDING_TTL = int(os.environ.get("SHARE_PENDING_TTL", 180))
@@ -45,7 +46,7 @@ def cookie_name(code):
 
 
 lock = threading.Lock()
-# code -> {text, file:(name,bytes)|None, hist:[{id,text}], hv, ts,
+# code -> {text, files:[{id,name,data,ts}], hist:[{id,text}], hv, ts,
 #          tokens:{tok:{ip,ua,master}}, pending:{id:{ip,ua,ts,state,tok}}}
 rooms = {}
 fails = {}   # ip -> [timestamps des joins ratés]
@@ -67,7 +68,7 @@ def cleanup(now):
 
 
 def total_bytes():
-    return sum(len(v["file"][1]) for v in rooms.values() if v["file"])
+    return sum(len(f["data"]) for v in rooms.values() for f in v["files"])
 
 
 def throttled(ip, now):
@@ -136,6 +137,8 @@ HTML = r"""<!doctype html>
   .item span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
     font-family:ui-monospace,monospace;font-size:.9rem}
   .item b{color:#888;font-weight:400;font-size:.8rem}
+  .item b.x{color:#b00;font-size:1rem;padding:0 4px}
+  .item b.x:hover{background:#fdd;border-radius:4px}
   .head{display:flex;justify-content:space-between;align-items:baseline;margin-top:12px}
   .head button{width:auto;background:none;color:#888;border:none;font-size:.85rem;padding:0}
   .head button:hover{color:#b00;background:none}
@@ -182,7 +185,11 @@ HTML = r"""<!doctype html>
   <hr>
   <input type="file" id="file">
   <button onclick="sendFile()">Envoyer le fichier</button>
-  <button id="dl" class="hidden" onclick="download()">⬇ Télécharger le fichier reçu</button>
+  <div class="head hidden" id="fileshead">
+    <small>Fichiers — cliquez pour télécharger</small>
+    <button onclick="clearFiles()">tout effacer</button>
+  </div>
+  <div id="files"></div>
 
   <div class="head hidden" id="histhead">
     <small>Historique — cliquez pour copier</small>
@@ -257,7 +264,7 @@ async function poll(){
     if(r.status === 403) return location.reload();     // déconnecté par le master
     if(r.ok){
       const d = await r.json();
-      $('dl').classList.toggle('hidden', !d.has_file);
+      renderFiles(d.files || []);
       if(master){ renderAsks(d.pending || []); renderPeers(d.members || []); }
       if(d.hv !== hv){ hv = d.hv; await loadHist(); }
       say('');
@@ -357,6 +364,12 @@ function copy(text, badge){
   }).catch(() => say("Copie refusée par le navigateur."));
 }
 
+async function clearFiles(){
+  if(!confirm("Supprimer tous les fichiers de la session ?")) return;
+  await fetch('/api/room/' + code + '/files', {method:'DELETE'});
+  $('files').dataset.k = '';
+}
+
 async function clearHist(){
   await fetch('/api/room/' + code + '/hist', {method:'DELETE'});
   hv = -1;
@@ -380,11 +393,42 @@ async function sendFile(){
   const fd = new FormData(); fd.append('file', f);
   say("Envoi…");
   const r = await fetch('/api/room/' + code + '/file', {method:'POST', body: fd});
-  say(r.ok ? "Fichier envoyé." : r.status === 413 ? "Fichier trop volumineux."
-      : r.status === 507 ? "Espace serveur saturé." : "Échec de l'envoi.");
+  if(r.ok){ $('file').value = ''; say("Fichier envoyé."); }
+  else say(r.status === 413 ? "Fichier trop volumineux."
+         : r.status === 507 ? "Espace serveur saturé." : "Échec de l'envoi.");
 }
 
-function download(){ location.href = '/api/room/' + code + '/file'; }
+function size(n){
+  return n < 1024 ? n + " o" : n < 1048576 ? (n / 1024).toFixed(0) + " Ko"
+                                           : (n / 1048576).toFixed(1) + " Mo";
+}
+
+function renderFiles(files){
+  const box = $('files');
+  const key = 'k' + files.map(f => f.id).join('|');
+  $('fileshead').classList.toggle('hidden', !files.length);
+  if(box.dataset.k === key) return;
+  box.dataset.k = key;
+  box.textContent = '';
+  for(const f of files){
+    const el = document.createElement('div');
+    el.className = 'item';
+    const s = document.createElement('span');
+    s.textContent = '⬇ ' + f.name;              // textContent : pas d'injection HTML
+    const b = document.createElement('b');
+    b.textContent = size(f.size) + ' — ' + new Date(f.ts * 1000).toLocaleTimeString('fr-FR');
+    const x = document.createElement('b');
+    x.className = 'x'; x.textContent = '✕'; x.title = 'supprimer';
+    x.onclick = async e => {
+      e.stopPropagation();                       // sinon le clic déclenche le téléchargement
+      await fetch('/api/room/' + code + '/file/' + f.id, {method:'DELETE'});
+      box.dataset.k = '';
+    };
+    el.append(s, b, x);
+    el.onclick = () => { location.href = '/api/room/' + code + '/file/' + f.id; };
+    box.append(el);
+  }
+}
 </script></body></html>"""
 
 
@@ -425,7 +469,7 @@ def join():
                 c = secrets.token_hex(3).upper()
                 if c not in rooms:
                     break
-            rooms[c] = {"code": c, "text": None, "file": None, "hist": [], "hv": 0,
+            rooms[c] = {"code": c, "text": None, "files": [], "hist": [], "hv": 0,
                         "ts": now, "tokens": {}, "pending": {}}
             tok = secrets.token_urlsafe(32)
             rooms[c]["tokens"][tok] = new_member(ip, ua, master=True)
@@ -532,8 +576,11 @@ def get_room(code):
         if not m:
             return jsonify(error="forbidden"), 403
         r["ts"] = time.time()
-        out = dict(text=r["text"], has_file=r["file"] is not None, hv=r["hv"],
-                   role="master" if m["master"] else "member")
+        out = dict(text=r["text"], hv=r["hv"],
+                   role="master" if m["master"] else "member",
+                   files=[{"id": f["id"], "name": f["name"],
+                           "size": len(f["data"]), "ts": f["ts"]}
+                          for f in reversed(r["files"])])
         if m["master"]:
             out["pending"] = [{"id": i, "ip": p["ip"], "ua": p["ua"]}
                               for i, p in r["pending"].items() if p["state"] == "pending"]
@@ -612,23 +659,56 @@ def set_file(code):
             return jsonify(error="not found"), 404
         if not member(r):
             return jsonify(error="forbidden"), 403
-        if total_bytes() - (len(r["file"][1]) if r["file"] else 0) + len(data) > MAX_TOTAL:
+        if total_bytes() + len(data) > MAX_TOTAL:
             return jsonify(error="storage full"), 507
-        r["file"], r["ts"] = (name, data), time.time()
-    return jsonify(ok=True, name=name)
+        fid = secrets.token_urlsafe(8)
+        r["files"].append({"id": fid, "name": name, "data": data, "ts": time.time()})
+        while len(r["files"]) > MAX_FILES:      # le plus ancien saute
+            r["files"].pop(0)
+        r["ts"] = time.time()
+    return jsonify(ok=True, id=fid, name=name)
 
 
-@app.get("/api/room/<code>/file")
-def get_file(code):
+@app.delete("/api/room/<code>/file/<fid>")
+def del_file(code, fid):
     with lock:
         r = room(code)
         if not r:
             return jsonify(error="not found"), 404
         if not member(r):
             return jsonify(error="forbidden"), 403
-        if not r["file"]:
+        before = len(r["files"])
+        r["files"] = [f for f in r["files"] if f["id"] != fid]
+        r["ts"] = time.time()
+        if len(r["files"]) == before:
             return jsonify(error="no file"), 404
-        name, data = r["file"]
+    return jsonify(ok=True)
+
+
+@app.delete("/api/room/<code>/files")
+def clear_files(code):
+    with lock:
+        r = room(code)
+        if not r:
+            return jsonify(error="not found"), 404
+        if not member(r):
+            return jsonify(error="forbidden"), 403
+        r["files"], r["ts"] = [], time.time()
+    return jsonify(ok=True)
+
+
+@app.get("/api/room/<code>/file/<fid>")
+def get_file(code, fid):
+    with lock:
+        r = room(code)
+        if not r:
+            return jsonify(error="not found"), 404
+        if not member(r):
+            return jsonify(error="forbidden"), 403
+        f = next((f for f in r["files"] if f["id"] == fid), None)
+        if not f:
+            return jsonify(error="no file"), 404
+        name, data = f["name"], f["data"]
         r["ts"] = time.time()
     return send_file(io.BytesIO(data), as_attachment=True, download_name=name,
                      mimetype="application/octet-stream")

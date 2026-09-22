@@ -41,7 +41,7 @@ assert g.get(f"/api/join/{code}/{req}").get_json()["state"] == "pending"
 
 # tant qu'il n'est pas accepté, aucun accès
 for path, meth in [(f"/api/room/{code}", "get"), (f"/api/room/{code}/hist", "get"),
-                   (f"/api/room/{code}/file", "get")]:
+                   (f"/api/room/{code}/file/x", "get")]:
     assert getattr(g, meth)(path).status_code == 403, path
 assert g.post(f"/api/room/{code}/text", json={"text": "intrus"}).status_code == 403
 
@@ -150,12 +150,47 @@ assert c.get(f"/api/room/{code}/hist").get_json()["hist"] == []
 assert c.delete("/api/room/ZZZZZZ/hist").status_code == 404
 c.post(f"/api/room/{code}/text", json={"text": "hello"})
 
-# --- fichier : nom nettoyé, pas de traversée de chemin --------------------
+# --- fichiers : nom nettoyé, pas de traversée de chemin -------------------
 r = c.post(f"/api/room/{code}/file",
            data={"file": (io.BytesIO(b"data"), "../../etc/passwd")})
 assert r.status_code == 200 and "/" not in r.get_json()["name"], r.get_json()
-dl = g.get(f"/api/room/{code}/file")
+fid = r.get_json()["id"]
+dl = g.get(f"/api/room/{code}/file/{fid}")
 assert dl.data == b"data" and dl.headers["Content-Type"] == "application/octet-stream"
+assert g.get(f"/api/room/{code}/file/inconnu").status_code == 404
+
+# les anciens fichiers restent téléchargeables
+fid2 = c.post(f"/api/room/{code}/file",
+              data={"file": (io.BytesIO(b"second"), "b.txt")}).get_json()["id"]
+assert g.get(f"/api/room/{code}/file/{fid}").data == b"data"      # le premier survit
+assert g.get(f"/api/room/{code}/file/{fid2}").data == b"second"
+lst = c.get(f"/api/room/{code}").get_json()["files"]
+assert [f["name"] for f in lst] == ["b.txt", "etc_passwd"], lst       # plus récent en tête
+assert lst[0]["size"] == 6 and lst[1]["size"] == 4
+
+# suppression d'un fichier, puis de tous
+tmp = c.post(f"/api/room/{code}/file",
+             data={"file": (io.BytesIO(b"jetable"), "t.txt")}).get_json()["id"]
+assert guest(REMOTE_ADDR="10.7.7.7").delete(f"/api/room/{code}/file/{tmp}").status_code == 403
+assert c.delete(f"/api/room/{code}/file/{tmp}").status_code == 200
+assert c.delete(f"/api/room/{code}/file/{tmp}").status_code == 404      # idempotent -> 404
+assert g.get(f"/api/room/{code}/file/{tmp}").status_code == 404
+assert [f["name"] for f in c.get(f"/api/room/{code}").get_json()["files"]] == ["b.txt", "etc_passwd"]
+assert g.delete(f"/api/room/{code}/files").status_code == 200           # un invité peut vider
+assert c.get(f"/api/room/{code}").get_json()["files"] == []
+assert guest(REMOTE_ADDR="10.7.7.8").delete(f"/api/room/{code}/files").status_code == 403
+fid = c.post(f"/api/room/{code}/file",
+             data={"file": (io.BytesIO(b"data"), "a.txt")}).get_json()["id"]
+c.post(f"/api/room/{code}/file", data={"file": (io.BytesIO(b"second"), "b.txt")})
+
+# plafond par room : le plus ancien saute
+S.MAX_FILES = 2
+old = c.post(f"/api/room/{code}/file",
+             data={"file": (io.BytesIO(b"troisieme"), "c.txt")}).get_json()["id"]
+assert [f["name"] for f in c.get(f"/api/room/{code}").get_json()["files"]] == ["c.txt", "b.txt"]
+assert g.get(f"/api/room/{code}/file/{fid}").status_code == 404   # évincé
+assert g.get(f"/api/room/{code}/file/{old}").status_code == 200
+S.MAX_FILES = 10
 
 # gros fichier : reste en RAM, aucun fichier temporaire sur disque
 import tempfile, os, io as _io
@@ -163,7 +198,7 @@ before = set(os.listdir(tempfile.gettempdir()))
 big = new()
 r = c.post(f"/api/room/{big}/file", data={"file": (_io.BytesIO(b"z" * 2_000_000), "gros.bin")})
 assert r.status_code == 200, r.status_code
-assert c.get(f"/api/room/{big}/file").data == b"z" * 2_000_000
+assert c.get(f"/api/room/{big}/file/{r.get_json()['id']}").data == b"z" * 2_000_000
 assert set(os.listdir(tempfile.gettempdir())) == before, "fichier temporaire laissé sur disque"
 
 # quota global
