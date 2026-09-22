@@ -231,15 +231,9 @@ HTML = r"""<!doctype html>
   <hr>
   <input type="file" id="file">
   <button onclick="sendFile()">Envoyer le fichier</button>
-  <div class="head hidden" id="fileshead">
-    <small>Fichiers — cliquez pour télécharger</small>
-    <button onclick="clearFiles()">tout effacer</button>
-  </div>
-  <div id="files"></div>
-
   <div class="head hidden" id="histhead">
-    <small>Historique — cliquez pour copier</small>
-    <button onclick="clearHist()">effacer</button>
+    <small>Historique — cliquez pour copier ou télécharger</small>
+    <button onclick="clearItems()">tout effacer</button>
   </div>
   <div id="hist"></div>
 </div>
@@ -247,7 +241,7 @@ HTML = r"""<!doctype html>
 
 <script>
 const MAX_FILE = __MAX_FILE__;
-let code = null, hv = -1, master = false;
+let code = null, v = -1, master = false;
 const $ = id => document.getElementById(id);
 const say = m => { $('msg').textContent = m || ''; };
 
@@ -323,9 +317,8 @@ async function poll(){
         setRole(d.role);
         if(master) say("Le créateur ne répondait plus : vous validez désormais les arrivants.");
       }
-      renderFiles(d.files || []);
       if(master){ renderAsks(d.pending || []); renderPeers(d.members || []); }
-      if(d.hv !== hv){ hv = d.hv; await loadHist(); }
+      if(d.v !== v){ v = d.v; await loadItems(); }
       say('');
     }
   } catch(e) { say("Connexion perdue, nouvelle tentative…"); }
@@ -396,42 +389,51 @@ function renderPeers(members){
   }
 }
 
-async function loadHist(){
-  const r = await fetch('/api/room/' + code + '/hist');
+async function loadItems(){
+  const r = await fetch('/api/room/' + code + '/items');
   if(!r.ok) return;
-  const hist = (await r.json()).hist;
+  const items = (await r.json()).items;
   const box = $('hist');
   box.textContent = '';
-  $('histhead').classList.toggle('hidden', !hist.length);
-  for(const h of hist){
+  $('histhead').classList.toggle('hidden', !items.length);
+  for(const it of items){
     const el = document.createElement('div');
     el.className = 'item';
+    const heure = new Date(it.ts * 1000).toLocaleTimeString('fr-FR');
     const s = document.createElement('span');
-    s.textContent = h.text.replace(/\s+/g, ' ').slice(0, 200);   // textContent = pas d'injection HTML
     const b = document.createElement('b');
-    b.textContent = '📋';
-    el.append(s, b);
-    el.onclick = () => copy(h.text, b);
+    if(it.kind === 'file'){
+      s.textContent = '⬇ ' + it.name;                            // textContent = pas d'injection HTML
+      b.textContent = size(it.size) + ' — ' + heure;
+      el.onclick = () => { location.href = '/api/room/' + code + '/file/' + it.id; };
+    } else {
+      s.textContent = it.text.replace(/\s+/g, ' ').slice(0, 200);
+      b.textContent = '📋 ' + heure;
+      el.onclick = () => copy(it.text, b, heure);
+    }
+    const x = document.createElement('b');
+    x.className = 'x'; x.textContent = '✕'; x.title = 'supprimer';
+    x.onclick = async e => {
+      e.stopPropagation();                   // sinon le clic déclenche aussi l'action de la ligne
+      await fetch('/api/room/' + code + '/items/' + it.id, {method:'DELETE'});
+      v = -1;
+    };
+    el.append(s, b, x);
     box.append(el);
   }
 }
 
-function copy(text, badge){
+function copy(text, badge, heure){
   navigator.clipboard.writeText(text).then(() => {
     badge.textContent = '✓ copié';
-    setTimeout(() => { badge.textContent = '📋'; }, 1200);
+    setTimeout(() => { badge.textContent = '📋 ' + heure; }, 1200);
   }).catch(() => say("Copie refusée par le navigateur."));
 }
 
-async function clearFiles(){
-  if(!confirm("Supprimer tous les fichiers de la session ?")) return;
-  await fetch('/api/room/' + code + '/files', {method:'DELETE'});
-  $('files').dataset.k = '';
-}
-
-async function clearHist(){
-  await fetch('/api/room/' + code + '/hist', {method:'DELETE'});
-  hv = -1;
+async function clearItems(){
+  if(!confirm("Effacer tout l'historique, fichiers compris ?")) return;
+  await fetch('/api/room/' + code + '/items', {method:'DELETE'});
+  v = -1;
 }
 
 async function sendText(){
@@ -442,7 +444,7 @@ async function sendText(){
   if(!r.ok) return say("Envoi refusé (texte trop long ou session expirée).");
   $('text').value = '';            // la zone est un champ de saisie : le partagé vit dans l'historique
   say('');
-  hv = -1;                         // recharge l'historique au prochain sondage
+  v = -1;                          // recharge l'historique au prochain sondage
 }
 
 async function sendFile(){
@@ -452,7 +454,7 @@ async function sendFile(){
   const fd = new FormData(); fd.append('file', f);
   say("Envoi…");
   const r = await fetch('/api/room/' + code + '/file', {method:'POST', body: fd});
-  if(r.ok){ $('file').value = ''; say("Fichier envoyé."); }
+  if(r.ok){ $('file').value = ''; v = -1; say("Fichier envoyé."); }
   else say(r.status === 413 ? "Fichier trop volumineux."
          : r.status === 507 ? "Espace serveur saturé." : "Échec de l'envoi.");
 }
@@ -462,32 +464,6 @@ function size(n){
                                            : (n / 1048576).toFixed(1) + " Mo";
 }
 
-function renderFiles(files){
-  const box = $('files');
-  const key = 'k' + files.map(f => f.id).join('|');
-  $('fileshead').classList.toggle('hidden', !files.length);
-  if(box.dataset.k === key) return;
-  box.dataset.k = key;
-  box.textContent = '';
-  for(const f of files){
-    const el = document.createElement('div');
-    el.className = 'item';
-    const s = document.createElement('span');
-    s.textContent = '⬇ ' + f.name;              // textContent : pas d'injection HTML
-    const b = document.createElement('b');
-    b.textContent = size(f.size) + ' — ' + new Date(f.ts * 1000).toLocaleTimeString('fr-FR');
-    const x = document.createElement('b');
-    x.className = 'x'; x.textContent = '✕'; x.title = 'supprimer';
-    x.onclick = async e => {
-      e.stopPropagation();                       // sinon le clic déclenche le téléchargement
-      await fetch('/api/room/' + code + '/file/' + f.id, {method:'DELETE'});
-      box.dataset.k = '';
-    };
-    el.append(s, b, x);
-    el.onclick = () => { location.href = '/api/room/' + code + '/file/' + f.id; };
-    box.append(el);
-  }
-}
 </script></body></html>"""
 
 

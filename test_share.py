@@ -46,7 +46,7 @@ req = r.get_json()["req"]
 assert g.get(f"/api/join/{code}/{req}").get_json()["state"] == "pending"
 
 # tant qu'il n'est pas accepté, aucun accès
-for path, meth in [(f"/api/room/{code}", "get"), (f"/api/room/{code}/hist", "get"),
+for path, meth in [(f"/api/room/{code}", "get"), (f"/api/room/{code}/items", "get"),
                    (f"/api/room/{code}/file/x", "get")]:
     assert getattr(g, meth)(path).status_code == 403, path
 assert g.post(f"/api/room/{code}/text", json={"text": "intrus"}).status_code == 403
@@ -175,31 +175,60 @@ assert c.post(f"/api/room/{code}/text", data="pas du json",
 
 # --- texte ----------------------------------------------------------------
 assert c.post(f"/api/room/{code}/text", json={"text": "hello"}).status_code == 200
-assert g.get(f"/api/room/{code}").get_json()["text"] == "hello"     # l'invité accepté lit bien
+assert g.get(f"/api/room/{code}/items").get_json()["items"][0]["text"] == "hello"  # l'invité lit
 assert c.post(f"/api/room/{code}/text", json={"text": "x" * (S.MAX_TEXT + 1)}).status_code == 400
 assert c.post(f"/api/room/{code}/text", json={"text": 42}).status_code == 400
 
-# --- historique -----------------------------------------------------------
-h = c.get(f"/api/room/{code}/hist").get_json()["hist"]
-assert [x["text"] for x in h] == ["hello"], h
+# --- historique unifié ----------------------------------------------------
+def items(cl=c):
+    return cl.get(f"/api/room/{code}/items").get_json()["items"]
+
+assert [x["text"] for x in items()] == ["hello"]
+assert items()[0]["kind"] == "text"
 c.post(f"/api/room/{code}/text", json={"text": "hello"})          # doublon ignoré
 c.post(f"/api/room/{code}/text", json={"text": "monde"})
 c.post(f"/api/room/{code}/text", json={"text": ""})               # vide ignoré
-assert [x["text"] for x in c.get(f"/api/room/{code}/hist").get_json()["hist"]] == ["monde", "hello"]
+assert [x["text"] for x in items()] == ["monde", "hello"]
 
-S.MAX_HIST = 3
-for i in range(6):
+# texte et fichiers dans la même liste, par ordre chronologique inverse
+mix = c.post(f"/api/room/{code}/file",
+             data={"file": (io.BytesIO(b"pdf"), "doc.pdf")}).get_json()["id"]
+c.post(f"/api/room/{code}/text", json={"text": "après le fichier"})
+assert [x["kind"] for x in items()] == ["text", "file", "text", "text"], items()
+assert items()[1]["name"] == "doc.pdf" and items()[1]["size"] == 3
+assert "text" not in items()[1] and "data" not in items()[1]      # les octets ne transitent pas
+assert c.get(f"/api/room/{code}/file/{mix}").data == b"pdf"
+
+# un plafond unique pour les deux types
+S.MAX_ITEMS = 3
+for i in range(3):
     c.post(f"/api/room/{code}/text", json={"text": f"n{i}"})
-assert [x["text"] for x in c.get(f"/api/room/{code}/hist").get_json()["hist"]] == ["n5", "n4", "n3"]
-
-S.MAX_HIST_CHARS = 10
+assert [x.get("text") for x in items()] == ["n2", "n1", "n0"]
+assert c.get(f"/api/room/{code}/file/{mix}").status_code == 404   # le fichier a été évincé
+S.MAX_ITEM_CHARS = 10
 c.post(f"/api/room/{code}/text", json={"text": "x" * 9})
-assert len(c.get(f"/api/room/{code}/hist").get_json()["hist"]) == 1
-S.MAX_HIST, S.MAX_HIST_CHARS = 20, 200_000
+assert len(items()) == 1
+S.MAX_ITEMS, S.MAX_ITEM_CHARS = 30, 200_000
 
-assert c.delete(f"/api/room/{code}/hist").status_code == 200
-assert c.get(f"/api/room/{code}/hist").get_json()["hist"] == []
-assert c.delete("/api/room/ZZZZZZ/hist").status_code == 404
+# suppression à l'unité, quel que soit le type
+t1 = c.post(f"/api/room/{code}/text", json={"text": "à jeter"}).get_json()["id"]
+f1 = c.post(f"/api/room/{code}/file",
+            data={"file": (io.BytesIO(b"x"), "j.bin")}).get_json()["id"]
+assert guest(REMOTE_ADDR="10.7.7.7").delete(f"/api/room/{code}/items/{t1}").status_code == 403
+assert c.delete(f"/api/room/{code}/items/{t1}").status_code == 200
+assert c.delete(f"/api/room/{code}/items/{t1}").status_code == 404
+assert c.delete(f"/api/room/{code}/items/{f1}").status_code == 200
+assert c.get(f"/api/room/{code}/file/{f1}").status_code == 404
+assert t1 not in [x["id"] for x in items()]
+
+# la version change à chaque mutation : c'est elle qui déclenche le rechargement
+v0 = c.get(f"/api/room/{code}").get_json()["v"]
+c.post(f"/api/room/{code}/text", json={"text": "bump"})
+assert c.get(f"/api/room/{code}").get_json()["v"] > v0
+
+assert g.delete(f"/api/room/{code}/items").status_code == 200     # un invité peut vider
+assert items() == []
+assert c.delete("/api/room/ZZZZZZ/items").status_code == 404
 c.post(f"/api/room/{code}/text", json={"text": "hello"})
 
 # --- fichiers : nom nettoyé, pas de traversée de chemin -------------------
@@ -214,35 +243,12 @@ assert g.get(f"/api/room/{code}/file/inconnu").status_code == 404
 # les anciens fichiers restent téléchargeables
 fid2 = c.post(f"/api/room/{code}/file",
               data={"file": (io.BytesIO(b"second"), "b.txt")}).get_json()["id"]
-assert g.get(f"/api/room/{code}/file/{fid}").data == b"data"      # le premier survit
+assert g.get(f"/api/room/{code}/file/{fid}").data == b"data"
 assert g.get(f"/api/room/{code}/file/{fid2}").data == b"second"
-lst = c.get(f"/api/room/{code}").get_json()["files"]
-assert [f["name"] for f in lst] == ["b.txt", "etc_passwd"], lst       # plus récent en tête
-assert lst[0]["size"] == 6 and lst[1]["size"] == 4
 
-# suppression d'un fichier, puis de tous
-tmp = c.post(f"/api/room/{code}/file",
-             data={"file": (io.BytesIO(b"jetable"), "t.txt")}).get_json()["id"]
-assert guest(REMOTE_ADDR="10.7.7.7").delete(f"/api/room/{code}/file/{tmp}").status_code == 403
-assert c.delete(f"/api/room/{code}/file/{tmp}").status_code == 200
-assert c.delete(f"/api/room/{code}/file/{tmp}").status_code == 404      # idempotent -> 404
-assert g.get(f"/api/room/{code}/file/{tmp}").status_code == 404
-assert [f["name"] for f in c.get(f"/api/room/{code}").get_json()["files"]] == ["b.txt", "etc_passwd"]
-assert g.delete(f"/api/room/{code}/files").status_code == 200           # un invité peut vider
-assert c.get(f"/api/room/{code}").get_json()["files"] == []
-assert guest(REMOTE_ADDR="10.7.7.8").delete(f"/api/room/{code}/files").status_code == 403
-fid = c.post(f"/api/room/{code}/file",
-             data={"file": (io.BytesIO(b"data"), "a.txt")}).get_json()["id"]
-c.post(f"/api/room/{code}/file", data={"file": (io.BytesIO(b"second"), "b.txt")})
-
-# plafond par room : le plus ancien saute
-S.MAX_FILES = 2
-old = c.post(f"/api/room/{code}/file",
-             data={"file": (io.BytesIO(b"troisieme"), "c.txt")}).get_json()["id"]
-assert [f["name"] for f in c.get(f"/api/room/{code}").get_json()["files"]] == ["c.txt", "b.txt"]
-assert g.get(f"/api/room/{code}/file/{fid}").status_code == 404   # évincé
-assert g.get(f"/api/room/{code}/file/{old}").status_code == 200
-S.MAX_FILES = 10
+# une entrée texte n'est pas téléchargeable comme un fichier
+tid = c.post(f"/api/room/{code}/text", json={"text": "pas un fichier"}).get_json()["id"]
+assert c.get(f"/api/room/{code}/file/{tid}").status_code == 404
 
 # gros fichier : reste en RAM, aucun fichier temporaire sur disque
 import tempfile, os, io as _io
