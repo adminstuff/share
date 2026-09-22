@@ -14,6 +14,7 @@ MAX_HIST_CHARS = int(os.environ.get("SHARE_MAX_HIST_CHARS", 200_000))  # par roo
 MAX_PENDING = int(os.environ.get("SHARE_MAX_PENDING", 5))              # demandes en attente
 PENDING_TTL = int(os.environ.get("SHARE_PENDING_TTL", 180))
 MAX_MEMBERS = int(os.environ.get("SHARE_MAX_MEMBERS", 10))
+MASTER_GONE = int(os.environ.get("SHARE_MASTER_GONE", 60))   # silence au-delà duquel on le déclare parti
 
 class MemoryParser(FormDataParser):
     """Par défaut werkzeug écrit sur disque au-delà de 500 Ko. Ici tout reste en RAM,
@@ -105,6 +106,25 @@ def member(r, master_only=False):
         return None
     m["seen"] = time.time()
     return m
+
+
+def master_alive(r, now=None):
+    now = now or time.time()
+    return any(x["master"] and now - x["seen"] < MASTER_GONE for x in r["tokens"].values())
+
+
+def succeed(r):
+    """Master silencieux : le plus ancien membre encore actif reprend la main.
+    Sans ça, plus personne ne peut accepter d'arrivant jusqu'à l'expiration de la room."""
+    now = time.time()
+    if master_alive(r, now):
+        return
+    live = [x for x in r["tokens"].values() if now - x["seen"] < MASTER_GONE]
+    if not live:
+        return
+    for x in r["tokens"].values():
+        x["master"] = False
+    min(live, key=lambda x: x["since"])["master"] = True
 
 
 def new_member(ip, ua, master=False):
@@ -235,14 +255,19 @@ async function enter(){
   opened(d.role);
 }
 
-function opened(role){
+function setRole(role){
   master = (role === 'master');
+  $('role').textContent = master ? '👑 Master' : 'invité';
+  $('role').className = 'badge' + (master ? ' m' : '');
+  if(!master){ $('asks').textContent = ''; $('peers').textContent = ''; $('peershead').classList.add('hidden'); }
+}
+
+function opened(role){
   $('join').classList.add('hidden');
   $('wait').style.display = 'none';
   $('zone').style.display = 'block';
   $('roomcode').textContent = code.slice(0, 3) + ' ' + code.slice(3);   // lisibilité à la dictée
-  $('role').textContent = master ? '👑 Master' : 'invité';
-  $('role').className = 'badge' + (master ? ' m' : '');
+  setRole(role);
   $('text').addEventListener('keydown', e => {          // Entrée = partager, Maj+Entrée = saut de ligne
     if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendText(); }
   });
@@ -258,7 +283,11 @@ async function waitApproval(req){
     $('join').classList.remove('hidden');
     return say("Demande refusée ou expirée.");
   }
-  if((await r.json()).state === 'ok') return opened('member');
+  const d = await r.json();
+  if(d.state === 'ok') return opened('member');
+  $('waitinfo').textContent = d.state === 'master_gone'
+    ? "⚠ Le créateur de la session ne répond plus. Prévenez-le, ou créez une nouvelle session."
+    : "Il verra votre IP et votre navigateur.";
   setTimeout(() => waitApproval(req), 2000);
 }
 
@@ -269,6 +298,10 @@ async function poll(){
     if(r.status === 403) return location.reload();     // déconnecté par le master
     if(r.ok){
       const d = await r.json();
+      if((d.role === 'master') !== master){        // promu à la mort du master
+        setRole(d.role);
+        if(master) say("Le créateur ne répondait plus : vous validez désormais les arrivants.");
+      }
       renderFiles(d.files || []);
       if(master){ renderAsks(d.pending || []); renderPeers(d.members || []); }
       if(d.hv !== hv){ hv = d.hv; await loadHist(); }
@@ -517,11 +550,13 @@ def join_status(code, req):
         p = r["pending"].get(req)
         if not p or (p["ip"], p["ua"]) != who():    # doit revenir du même poste
             return jsonify(error="not found"), 404
-        if p["state"] == "no":
-            r["pending"].pop(req, None)
-            return jsonify(error="denied"), 403
+        if p["state"] == "no" or (p["state"] == "pending"
+                                  and time.time() - p["ts"] > PENDING_TTL):
+            r["pending"].pop(req, None)             # l'attente expire ici aussi, pas
+            return jsonify(error="denied"), 403     # seulement dans cleanup()
         if p["state"] != "ok":
-            return jsonify(state="pending")
+            # personne ne peut plus accepter : le dire tout de suite
+            return jsonify(state="pending" if master_alive(r) else "master_gone")
         tok = p["tok"]
         r["pending"].pop(req, None)                 # jeton retiré une seule fois
         r["ts"] = time.time()
@@ -580,6 +615,7 @@ def get_room(code):
         m = member(r)
         if not m:
             return jsonify(error="forbidden"), 403
+        succeed(r)                       # m["seen"] vient d'être mis à jour par member()
         r["ts"] = time.time()
         out = dict(text=r["text"], hv=r["hv"],
                    role="master" if m["master"] else "member",

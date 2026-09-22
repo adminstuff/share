@@ -123,6 +123,52 @@ req = r.get_json()["req"]
 c.post(f"/api/room/{code}/pending/{req}", json={"state": "ok"})
 assert g.get(f"/api/join/{code}/{req}").get_json()["state"] == "ok"
 
+# --- master mort : attente bornée et succession ---------------------------
+mc = S.app.test_client(); mc.environ_base.update({"REMOTE_ADDR": "10.1.0.1", "HTTP_USER_AGENT": "M"})
+room2 = mc.post("/api/join", json={}).get_json()["code"]
+
+def joins(cl):
+    q = cl.post("/api/join", json={"code": room2}).get_json()["req"]
+    mc.post(f"/api/room/{room2}/pending/{q}", json={"state": "ok"})
+    assert cl.get(f"/api/join/{room2}/{q}").get_json()["state"] == "ok"
+
+a1 = S.app.test_client(); a1.environ_base.update({"REMOTE_ADDR": "10.1.0.2", "HTTP_USER_AGENT": "A"})
+a2 = S.app.test_client(); a2.environ_base.update({"REMOTE_ADDR": "10.1.0.3", "HTTP_USER_AGENT": "B"})
+joins(a1); joins(a2)
+
+# le master se tait
+for t in S.rooms[room2]["tokens"].values():
+    if t["master"]:
+        t["seen"] -= S.MASTER_GONE + 1
+
+# un invité en attente est prévenu au lieu d'attendre dans le vide
+w = S.app.test_client(); w.environ_base.update({"REMOTE_ADDR": "10.1.0.9", "HTTP_USER_AGENT": "W"})
+wreq = w.post("/api/join", json={"code": room2}).get_json()["req"]
+assert w.get(f"/api/join/{room2}/{wreq}").get_json()["state"] == "master_gone"
+
+# le plus ancien membre actif reprend la main à son sondage
+assert a1.get(f"/api/room/{room2}").get_json()["role"] == "master"
+assert a2.get(f"/api/room/{room2}").get_json()["role"] == "member"
+assert mc.get(f"/api/room/{room2}").get_json()["role"] == "member"   # l'ancien est rétrogradé
+
+# et le nouveau master peut accepter
+assert a1.post(f"/api/room/{room2}/pending/{wreq}", json={"state": "ok"}).status_code == 200
+assert w.get(f"/api/join/{room2}/{wreq}").get_json()["state"] == "ok"
+
+# l'attente expire d'elle-même, sans qu'aucun POST /api/join ne la déclenche
+w2 = S.app.test_client(); w2.environ_base.update({"REMOTE_ADDR": "10.1.0.10", "HTTP_USER_AGENT": "W2"})
+w2req = w2.post("/api/join", json={"code": room2}).get_json()["req"]
+S.rooms[room2]["pending"][w2req]["ts"] -= S.PENDING_TTL + 1
+assert w2.get(f"/api/join/{room2}/{w2req}").status_code == 403
+
+# aucun membre actif : pas de succession arbitraire
+solo = S.app.test_client(); solo.environ_base.update({"REMOTE_ADDR": "10.2.0.1", "HTTP_USER_AGENT": "S"})
+room3 = solo.post("/api/join", json={}).get_json()["code"]
+for t in S.rooms[room3]["tokens"].values():
+    t["seen"] -= S.MASTER_GONE + 1
+S.succeed(S.rooms[room3])
+assert sum(t["master"] for t in S.rooms[room3]["tokens"].values()) == 1   # le master reste titulaire
+
 # --- corps non-JSON accepté sans crash ------------------------------------
 assert c.post(f"/api/room/{code}/text", data="pas du json",
               content_type="application/json").status_code in (200, 400)
