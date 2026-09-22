@@ -28,6 +28,12 @@ assert len(code) == 6
 assert c.post("/api/join", json={"code": code.lower()}).get_json()["role"] == "master"
 assert c.get(f"/api/room/{code.lower()}").status_code == 200
 
+# code saisi avec des espaces (tel qu'affiché : "A3F 9C2")
+espace = code[:3] + " " + code[3:]
+assert c.post("/api/join", json={"code": espace}).get_json()["code"] == code
+assert c.post("/api/join", json={"code": f"  {espace.lower()} "}).get_json()["code"] == code
+assert c.get(f"/api/room/{espace}").status_code == 200
+
 # codes invalides et inconnus -> 404, jamais 500
 for bad in ["../etc", "ZZZZZZ", "", "A" * 200]:
     assert c.get(f"/api/room/{bad}").status_code == 404, bad

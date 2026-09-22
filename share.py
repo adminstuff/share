@@ -79,9 +79,14 @@ def throttled(ip, now):
     return len(t) >= 10
 
 
+def norm(code):
+    """"a3f 9c2" -> "A3F9C2" : les espaces de lisibilité ne doivent pas gêner."""
+    return re.sub(r"\s+", "", code or "").upper()
+
+
 def room(code):
     """Room valide et vivante, ou None. Appeler sous `lock`."""
-    code = (code or "").strip().upper()
+    code = norm(code)
     if not CODE_RE.match(code):
         return None
     r = rooms.get(code)
@@ -160,7 +165,7 @@ HTML = r"""<!doctype html>
 
 <div id="join">
   <div class="row">
-    <input id="code" placeholder="Code (laisser vide pour créer)" maxlength="6">
+    <input id="code" placeholder="Code (laisser vide pour créer)" maxlength="7">
     <button style="width:auto" onclick="enter()">Go</button>
   </div>
   <small>Partagez le code avec l'autre poste. Expire après 1h.</small>
@@ -206,7 +211,7 @@ const $ = id => document.getElementById(id);
 const say = m => { $('msg').textContent = m || ''; };
 
 async function enter(){
-  const c = $('code').value.trim().toUpperCase();
+  const c = $('code').value.replace(/\s+/g, '').toUpperCase();
   say('');
   let r;
   try {
@@ -235,8 +240,8 @@ function opened(role){
   $('join').classList.add('hidden');
   $('wait').style.display = 'none';
   $('zone').style.display = 'block';
-  $('roomcode').textContent = code;
-  $('role').textContent = master ? '👑 master — vous validez les arrivants' : 'invité';
+  $('roomcode').textContent = code.slice(0, 3) + ' ' + code.slice(3);   // lisibilité à la dictée
+  $('role').textContent = master ? '👑 Master' : 'invité';
   $('role').className = 'badge' + (master ? ' m' : '');
   $('text').addEventListener('keydown', e => {          // Entrée = partager, Maj+Entrée = saut de ligne
     if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendText(); }
@@ -460,7 +465,7 @@ def join():
     ip, ua = who()
     with lock:
         cleanup(now)
-        c = ((request.get_json(silent=True) or {}).get("code") or "").strip().upper()
+        c = norm((request.get_json(silent=True) or {}).get("code"))
 
         if not c:                                   # création : le créateur est master
             if len(rooms) >= MAX_ROOMS:
