@@ -8,9 +8,8 @@ MAX_FILE = int(os.environ.get("SHARE_MAX_FILE", 25 * 1024 * 1024))
 MAX_TOTAL = int(os.environ.get("SHARE_MAX_TOTAL", 512 * 1024 * 1024))
 MAX_ROOMS = int(os.environ.get("SHARE_MAX_ROOMS", 500))
 MAX_TEXT = int(os.environ.get("SHARE_MAX_TEXT", 100_000))
-MAX_HIST = int(os.environ.get("SHARE_MAX_HIST", 20))                   # entrées gardées
-MAX_FILES = int(os.environ.get("SHARE_MAX_FILES", 10))                 # fichiers gardés par room
-MAX_HIST_CHARS = int(os.environ.get("SHARE_MAX_HIST_CHARS", 200_000))  # par room
+MAX_ITEMS = int(os.environ.get("SHARE_MAX_ITEMS", 30))                 # entrées gardées par room
+MAX_ITEM_CHARS = int(os.environ.get("SHARE_MAX_ITEM_CHARS", 200_000))  # poids du texte, par room
 MAX_PENDING = int(os.environ.get("SHARE_MAX_PENDING", 5))              # demandes en attente
 PENDING_TTL = int(os.environ.get("SHARE_PENDING_TTL", 180))
 MAX_MEMBERS = int(os.environ.get("SHARE_MAX_MEMBERS", 10))
@@ -47,7 +46,7 @@ def cookie_name(code):
 
 
 lock = threading.Lock()
-# code -> {text, files:[{id,name,data,ts}], hist:[{id,text}], hv, ts,
+# code -> {items:[{id,kind:"text"|"file",ts, text|name+data}], v, ts,
 #          tokens:{tok:{ip,ua,master}}, pending:{id:{ip,ua,ts,state,tok}}}
 rooms = {}
 fails = {}   # ip -> [timestamps des joins ratés]
@@ -69,7 +68,29 @@ def cleanup(now):
 
 
 def total_bytes():
-    return sum(len(f["data"]) for v in rooms.values() for f in v["files"])
+    return sum(len(i["data"]) for v in rooms.values()
+               for i in v["items"] if i["kind"] == "file")
+
+
+def add(r, item):
+    """Empile une entrée et rogne les plus anciennes jusqu'à respecter les plafonds."""
+    r["v"] += 1
+    item["id"] = secrets.token_urlsafe(8)
+    item["ts"] = time.time()
+    r["items"].append(item)
+    while len(r["items"]) > MAX_ITEMS or \
+            sum(len(i["text"]) for i in r["items"] if i["kind"] == "text") > MAX_ITEM_CHARS:
+        r["items"].pop(0)
+    r["ts"] = item["ts"]
+    return item["id"]
+
+
+def listing(r):
+    """Métadonnées + texte, sans les octets des fichiers. Plus récent en tête."""
+    return [{"id": i["id"], "kind": i["kind"], "ts": i["ts"],
+             **({"text": i["text"]} if i["kind"] == "text"
+                else {"name": i["name"], "size": len(i["data"])})}
+            for i in reversed(r["items"])]
 
 
 def throttled(ip, now):
@@ -487,6 +508,19 @@ def index():
     return render_template_string(HTML.replace("__MAX_FILE__", str(MAX_FILE)))
 
 
+@app.get("/api/whoami")
+def whoami():
+    """Diagnostic proxy : dit quelle IP l'app retient pour VOUS, et pourquoi.
+    Ne révèle que les données de votre propre requête."""
+    ip, ua = who()
+    xff = request.headers.get("X-Forwarded-For", "")
+    return jsonify(ip=ip, x_forwarded_for=xff,
+                   entrees=[x.strip() for x in xff.split(",")] if xff else [],
+                   hops=int(os.environ.get("SHARE_PROXY_HOPS", 1)),
+                   trust_proxy=bool(os.environ.get("SHARE_TRUST_PROXY")),
+                   ua=ua)
+
+
 @app.get("/healthz")
 def healthz():
     return jsonify(ok=True, rooms=len(rooms))
@@ -507,7 +541,7 @@ def join():
                 c = secrets.token_hex(3).upper()
                 if c not in rooms:
                     break
-            rooms[c] = {"code": c, "text": None, "files": [], "hist": [], "hv": 0,
+            rooms[c] = {"code": c, "items": [], "v": 0,
                         "ts": now, "tokens": {}, "pending": {}}
             tok = secrets.token_urlsafe(32)
             rooms[c]["tokens"][tok] = new_member(ip, ua, master=True)
@@ -617,11 +651,7 @@ def get_room(code):
             return jsonify(error="forbidden"), 403
         succeed(r)                       # m["seen"] vient d'être mis à jour par member()
         r["ts"] = time.time()
-        out = dict(text=r["text"], hv=r["hv"],
-                   role="master" if m["master"] else "member",
-                   files=[{"id": f["id"], "name": f["name"],
-                           "size": len(f["data"]), "ts": f["ts"]}
-                          for f in reversed(r["files"])])
+        out = dict(v=r["v"], role="master" if m["master"] else "member")
         if m["master"]:
             out["pending"] = [{"id": i, "ip": p["ip"], "ua": p["ua"]}
                               for i, p in r["pending"].items() if p["state"] == "pending"]
@@ -632,8 +662,8 @@ def get_room(code):
         return jsonify(out)
 
 
-@app.get("/api/room/<code>/hist")
-def get_hist(code):
+@app.get("/api/room/<code>/items")
+def get_items(code):
     with lock:
         r = room(code)
         if not r:
@@ -641,19 +671,36 @@ def get_hist(code):
         if not member(r):
             return jsonify(error="forbidden"), 403
         r["ts"] = time.time()
-        return jsonify(hist=list(reversed(r["hist"])))
+        return jsonify(items=listing(r), v=r["v"])
 
 
-@app.delete("/api/room/<code>/hist")
-def clear_hist(code):
+@app.delete("/api/room/<code>/items/<iid>")
+def del_item(code, iid):
     with lock:
         r = room(code)
         if not r:
             return jsonify(error="not found"), 404
         if not member(r):
             return jsonify(error="forbidden"), 403
-        r["hist"], r["ts"] = [], time.time()
-        r["hv"] += 1
+        before = len(r["items"])
+        r["items"] = [i for i in r["items"] if i["id"] != iid]
+        if len(r["items"]) == before:
+            return jsonify(error="not found"), 404
+        r["v"] += 1
+        r["ts"] = time.time()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/room/<code>/items")
+def clear_items(code):
+    with lock:
+        r = room(code)
+        if not r:
+            return jsonify(error="not found"), 404
+        if not member(r):
+            return jsonify(error="forbidden"), 403
+        r["items"], r["ts"] = [], time.time()
+        r["v"] += 1
     return jsonify(ok=True)
 
 
@@ -668,15 +715,11 @@ def set_text(code):
             return jsonify(error="not found"), 404
         if not member(r):
             return jsonify(error="forbidden"), 403
-        r["text"], r["ts"] = text, time.time()
-        if text and (not r["hist"] or r["hist"][-1]["text"] != text):
-            r["hv"] += 1
-            r["hist"].append({"id": r["hv"], "text": text})
-            # ponytail: on borne le nombre d'entrées ET leur poids total.
-            while len(r["hist"]) > MAX_HIST or \
-                    sum(len(h["text"]) for h in r["hist"]) > MAX_HIST_CHARS:
-                r["hist"].pop(0)
-    return jsonify(ok=True)
+        last = next((i for i in reversed(r["items"]) if i["kind"] == "text"), None)
+        if not text or (last and last["text"] == text):
+            return jsonify(ok=True, skipped=True)     # vide ou doublon consécutif
+        iid = add(r, {"kind": "text", "text": text})
+    return jsonify(ok=True, id=iid)
 
 
 @app.post("/api/room/<code>/file")
@@ -702,40 +745,8 @@ def set_file(code):
             return jsonify(error="forbidden"), 403
         if total_bytes() + len(data) > MAX_TOTAL:
             return jsonify(error="storage full"), 507
-        fid = secrets.token_urlsafe(8)
-        r["files"].append({"id": fid, "name": name, "data": data, "ts": time.time()})
-        while len(r["files"]) > MAX_FILES:      # le plus ancien saute
-            r["files"].pop(0)
-        r["ts"] = time.time()
+        fid = add(r, {"kind": "file", "name": name, "data": data})
     return jsonify(ok=True, id=fid, name=name)
-
-
-@app.delete("/api/room/<code>/file/<fid>")
-def del_file(code, fid):
-    with lock:
-        r = room(code)
-        if not r:
-            return jsonify(error="not found"), 404
-        if not member(r):
-            return jsonify(error="forbidden"), 403
-        before = len(r["files"])
-        r["files"] = [f for f in r["files"] if f["id"] != fid]
-        r["ts"] = time.time()
-        if len(r["files"]) == before:
-            return jsonify(error="no file"), 404
-    return jsonify(ok=True)
-
-
-@app.delete("/api/room/<code>/files")
-def clear_files(code):
-    with lock:
-        r = room(code)
-        if not r:
-            return jsonify(error="not found"), 404
-        if not member(r):
-            return jsonify(error="forbidden"), 403
-        r["files"], r["ts"] = [], time.time()
-    return jsonify(ok=True)
 
 
 @app.get("/api/room/<code>/file/<fid>")
@@ -746,7 +757,8 @@ def get_file(code, fid):
             return jsonify(error="not found"), 404
         if not member(r):
             return jsonify(error="forbidden"), 403
-        f = next((f for f in r["files"] if f["id"] == fid), None)
+        f = next((i for i in r["items"]
+                  if i["id"] == fid and i["kind"] == "file"), None)
         if not f:
             return jsonify(error="no file"), 404
         name, data = f["name"], f["data"]
