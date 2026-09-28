@@ -299,6 +299,23 @@ S.TTL = 1_000_000
 c.post("/api/join", json={})          # déclenche cleanup()
 assert old not in S.rooms
 
+# --- drapeaux d'environnement ---------------------------------------------
+import os as _os
+for val, attendu in [("1", True), ("true", True), ("0", False), ("false", False),
+                     ("no", False), ("", False)]:
+    _os.environ["SHARE_T"] = val
+    assert S.flag("SHARE_T") is attendu, (val, attendu)
+del _os.environ["SHARE_T"]
+assert S.flag("SHARE_ABSENT") is False
+assert S.flag("SHARE_ABSENT", default=True) is True      # défaut Cloud Run
+
+# --- scans automatiques : tout en 404, aucune route statique --------------
+for u in ["/wp-admin/", "/.env", "/.git/config", "/static/x.js",
+          "/static/../share.py", "/admin.php", "/api/", "/api/room/"]:
+    assert c.get(u).status_code in (404, 405), (u, c.get(u).status_code)
+assert not any(r.endswith("static/<path:filename>") for r in
+               [str(r) for r in S.app.url_map.iter_rules()]), "route statique encore présente"
+
 # --- en-têtes de sécurité et cookie ---------------------------------------
 h = c.get("/").headers
 assert h["X-Content-Type-Options"] == "nosniff" and "frame-ancestors 'none'" in h["Content-Security-Policy"]

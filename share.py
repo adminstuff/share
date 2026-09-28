@@ -27,11 +27,21 @@ class MemoryRequest(Request):
     form_data_parser_class = MemoryParser
 
 
-app = Flask(__name__)
+# static_folder=None : l'app n'a aucun fichier à servir, autant supprimer la route
+app = Flask(__name__, static_folder=None)
 app.request_class = MemoryRequest
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE + 4096  # werkzeug rejette au-delà -> 413
 
-TRUST_PROXY = bool(os.environ.get("SHARE_TRUST_PROXY"))
+def flag(name, default=False):
+    """SHARE_X=0 / false / no désactive vraiment. bool("0") vaudrait True."""
+    v = os.environ.get(name)
+    return default if v is None else v.strip().lower() not in ("", "0", "false", "no")
+
+
+# Sur Cloud Run (K_SERVICE), l'app n'est joignable qu'à travers le frontal Google :
+# lui faire confiance est le bon défaut, et évite l'état à moitié configuré où
+# waitress supprime les en-têtes et où toutes les IP se confondent.
+TRUST_PROXY = flag("SHARE_TRUST_PROXY", default=bool(os.environ.get("K_SERVICE")))
 
 if TRUST_PROXY:
     # hops = nombre de proxys de confiance devant l'app. 1 derrière Caddy/nginx,
@@ -767,4 +777,5 @@ if __name__ == "__main__":
     # waitress supprime les en-têtes X-Forwarded-* par défaut ; sans ça, ProxyFix
     # n'a rien à lire et tous les clients partagent l'IP interne de l'hébergeur.
     serve(app, host=host, port=port, threads=8,
-          clear_untrusted_proxy_headers=not TRUST_PROXY)
+          clear_untrusted_proxy_headers=not TRUST_PROXY,
+          ident=None)          # pas d'en-tête Server : rien à empreindre pour les scanners
