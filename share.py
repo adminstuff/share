@@ -31,7 +31,9 @@ app = Flask(__name__)
 app.request_class = MemoryRequest
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE + 4096  # werkzeug rejette au-delà -> 413
 
-if os.environ.get("SHARE_TRUST_PROXY"):
+TRUST_PROXY = bool(os.environ.get("SHARE_TRUST_PROXY"))
+
+if TRUST_PROXY:
     # hops = nombre de proxys de confiance devant l'app. 1 derrière Caddy/nginx,
     # 2 sur Cloud Run (X-Forwarded-For: <client>,<load-balancer>). À vérifier sur
     # l'IP affichée dans la liste des postes connectés.
@@ -54,6 +56,12 @@ fails = {}   # ip -> [timestamps des joins ratés]
 
 def who():
     return (request.remote_addr or "?", request.headers.get("User-Agent", "")[:200])
+
+
+def ip_known(ip):
+    """False quand l'hébergeur ne transmet pas l'IP client : Cloud Run livre alors
+    sa propre adresse de lien-local, identique pour tout le monde."""
+    return bool(ip) and ip != "?" and not ip.startswith("169.254.")
 
 
 def cleanup(now):
@@ -243,6 +251,8 @@ HTML = r"""<!doctype html>
 const MAX_FILE = __MAX_FILE__;
 let code = null, v = -1, master = false;
 const $ = id => document.getElementById(id);
+// l'hébergeur masque parfois l'IP client : mieux vaut le dire que d'afficher son adresse interne
+const montreIp = ip => (!ip || ip.startsWith('169.254.')) ? "IP masquée par l'hébergeur" : "IP " + ip;
 const say = m => { $('msg').textContent = m || ''; };
 
 async function enter(){
@@ -264,7 +274,8 @@ async function enter(){
   if(r.status === 202){                       // en attente d'approbation
     $('join').classList.add('hidden');
     $('wait').style.display = 'block';
-    $('waitinfo').textContent = "Il verra votre IP (" + d.ip + ") et votre navigateur.";
+    $('waitinfo').textContent = d.ip ? "Il verra votre IP (" + d.ip + ") et votre navigateur."
+                                     : "Il verra votre navigateur.";
     return waitApproval(d.req);
   }
   opened(d.role);
@@ -335,7 +346,7 @@ function renderAsks(pending){
     const d = document.createElement('div');
     d.className = 'ask';
     const t = document.createElement('p');
-    t.textContent = "Un poste demande à rejoindre — IP " + p.ip;   // textContent : pas d'injection
+    t.textContent = "Un poste demande à rejoindre — " + montreIp(p.ip);   // textContent : pas d'injection
     const ua = document.createElement('code');
     ua.textContent = p.ua || "navigateur inconnu";
     const row = document.createElement('div');
@@ -370,7 +381,7 @@ function renderPeers(members){
     el.className = 'peer';
     const info = document.createElement('div');
     const t = document.createElement('b');
-    t.textContent = m.ip + (m.master ? ' 👑' : '') + (m.me ? ' (vous)' : '');
+    t.textContent = montreIp(m.ip) + (m.master ? ' 👑' : '') + (m.me ? ' (vous)' : '');
     const ua = document.createElement('code');
     ua.textContent = (m.ua || 'navigateur inconnu') + ' — depuis ' +
       new Date(m.since * 1000).toLocaleTimeString('fr-FR');
@@ -493,7 +504,7 @@ def whoami():
     return jsonify(ip=ip, x_forwarded_for=xff,
                    entrees=[x.strip() for x in xff.split(",")] if xff else [],
                    hops=int(os.environ.get("SHARE_PROXY_HOPS", 1)),
-                   trust_proxy=bool(os.environ.get("SHARE_TRUST_PROXY")),
+                   trust_proxy=TRUST_PROXY,
                    ua=ua,
                    # quel en-tête porte l'IP client dépend de l'hébergeur : on les montre tous
                    headers={k: v for k, v in request.headers.items()
@@ -544,13 +555,14 @@ def join():
         live = [p for p in r["pending"].values() if p["state"] == "pending"]
         if len(live) >= MAX_PENDING:
             return jsonify(error="too many pending"), 429
-        if any((p["ip"], p["ua"]) == (ip, ua) for p in live):
+        # dédoublonnage seulement si l'IP distingue vraiment les postes
+        if ip_known(ip) and any((p["ip"], p["ua"]) == (ip, ua) for p in live):
             return jsonify(error="already pending"), 429
 
         req = secrets.token_urlsafe(16)
         r["pending"][req] = {"ip": ip, "ua": ua, "ts": now, "state": "pending", "tok": None}
         r["ts"] = now
-    return jsonify(code=c, req=req, ip=ip), 202
+    return jsonify(code=c, req=req, ip=ip if ip_known(ip) else None), 202
 
 
 @app.get("/api/join/<code>/<req>")
@@ -751,5 +763,8 @@ if __name__ == "__main__":
     host = os.environ.get("SHARE_HOST", "0.0.0.0")
     # PORT est imposé par Cloud Run / Heroku / Scaleway et doit primer.
     port = int(os.environ.get("PORT") or os.environ.get("SHARE_PORT", 5000))
-    print(f"share: écoute sur {host}:{port}", flush=True)
-    serve(app, host=host, port=port, threads=8)
+    print(f"share: écoute sur {host}:{port} (trust_proxy={TRUST_PROXY})", flush=True)
+    # waitress supprime les en-têtes X-Forwarded-* par défaut ; sans ça, ProxyFix
+    # n'a rien à lire et tous les clients partagent l'IP interne de l'hébergeur.
+    serve(app, host=host, port=port, threads=8,
+          clear_untrusted_proxy_headers=not TRUST_PROXY)

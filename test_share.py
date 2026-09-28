@@ -169,6 +169,25 @@ for t in S.rooms[room3]["tokens"].values():
 S.succeed(S.rooms[room3])
 assert sum(t["master"] for t in S.rooms[room3]["tokens"].values()) == 1   # le master reste titulaire
 
+# --- hébergeur qui masque l'IP client (Cloud Run sans X-Forwarded-For) ----
+assert not S.ip_known("169.254.169.126") and not S.ip_known("?")
+assert S.ip_known("203.0.113.7")
+
+hidden = {"REMOTE_ADDR": "169.254.169.126"}
+hm = S.app.test_client(); hm.environ_base.update({**hidden, "HTTP_USER_AGENT": "Chrome/1"})
+hroom = hm.post("/api/join", json={}).get_json()["code"]
+# deux postes derrière la même IP masquée ET le même navigateur doivent pouvoir demander
+h1 = S.app.test_client(); h1.environ_base.update({**hidden, "HTTP_USER_AGENT": "Chrome/2"})
+h2 = S.app.test_client(); h2.environ_base.update({**hidden, "HTTP_USER_AGENT": "Chrome/2"})
+assert h1.post("/api/join", json={"code": hroom}).status_code == 202
+r2 = h2.post("/api/join", json={"code": hroom})
+assert r2.status_code == 202, r2.get_json()          # sinon le 2e collègue était refusé
+assert r2.get_json()["ip"] is None                   # on n'affiche pas une IP trompeuse
+# avec une vraie IP, le dédoublonnage protège toujours du spam
+v1 = S.app.test_client(); v1.environ_base.update({"REMOTE_ADDR": "203.0.113.7", "HTTP_USER_AGENT": "X"})
+v1.post("/api/join", json={"code": hroom})
+assert v1.post("/api/join", json={"code": hroom}).status_code == 429
+
 # --- corps non-JSON accepté sans crash ------------------------------------
 assert c.post(f"/api/room/{code}/text", data="pas du json",
               content_type="application/json").status_code in (200, 400)
