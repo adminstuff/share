@@ -494,7 +494,10 @@ def whoami():
                    entrees=[x.strip() for x in xff.split(",")] if xff else [],
                    hops=int(os.environ.get("SHARE_PROXY_HOPS", 1)),
                    trust_proxy=bool(os.environ.get("SHARE_TRUST_PROXY")),
-                   ua=ua)
+                   ua=ua,
+                   # quel en-tête porte l'IP client dépend de l'hébergeur : on les montre tous
+                   headers={k: v for k, v in request.headers.items()
+                            if k.lower() not in ("cookie", "authorization")})
 
 
 @app.get("/healthz")
